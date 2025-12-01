@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PII Shield Demo</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .json-pre { white-space: pre-wrap; word-wrap: break-word; font-size: 0.75rem; }
+        .chat-bubble { max-width: 80%; padding: 0.75rem; border-radius: 0.5rem; margin-bottom: 0.5rem; }
+        .user-bubble { background-color: #e0f2fe; color: #0369a1; align-self: flex-end; margin-left: auto; }
+        .bot-bubble { background-color: #f3f4f6; color: #374151; align-self: flex-start; margin-right: auto; }
+        
+        /* PII Highlighting Colors */
+        .pii-highlight {
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .pii-PERSON { background-color: #fef3c7; color: #92400e; }
+        .pii-DATE_TIME { background-color: #ddd6fe; color: #5b21b6; }
+        .pii-IN_PAN { background-color: #fecaca; color: #991b1b; }
+        .pii-IN_AADHAAR { background-color: #fed7aa; color: #9a3412; }
+        .pii-EMAIL_ADDRESS { background-color: #bfdbfe; color: #1e40af; }
+        .pii-PHONE_NUMBER { background-color: #d1fae5; color: #065f46; }
+        .pii-CREDIT_CARD { background-color: #fce7f3; color: #9f1239; }
+        .pii-default { background-color: #e5e7eb; color: #374151; }
+        
+        /* Source badges */
+        .source-badge {
+            display: inline-block;
+            font-size: 0.65rem;
+            padding: 1px 6px;
+            border-radius: 9999px;
+            margin-left: 4px;
+            font-weight: 600;
+        }
+        .source-BERT { background-color: #c7d2fe; color: #3730a3; }
+        .source-Presidio { background-color: #d1fae5; color: #065f46; }
+        
+        /* Mapping visual */
+        .mapping-item {
+            display: flex;
+            align-items: center;
+            padding: 8px;
+            margin: 4px 0;
+            background: #f9fafb;
+            border-radius: 6px;
+            border-left: 3px solid #3b82f6;
+        }
+        .mapping-arrow {
+            margin: 0 12px;
+            color: #9ca3af;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 h-screen flex flex-col overflow-hidden">
+    <!-- Header -->
+    <header class="bg-blue-600 text-white p-4 shadow-md">
+        <h1 class="text-xl font-bold">🛡️ PII Shield Enterprise Demo</h1>
+        <p class="text-sm opacity-80">3-Phase Detection: BERT + Presidio + Optimization</p>
+    </header>
+
+    <!-- Main Content -->
+    <div class="flex-1 flex overflow-hidden">
+        <!-- Left: Chat Interface -->
+        <div class="w-1/2 flex flex-col border-r border-gray-300 bg-white">
+            <div class="p-3 border-b bg-gray-50 font-semibold text-gray-700">💬 Chat Interface</div>
+            <div id="chat-container" class="flex-1 p-4 overflow-y-auto flex flex-col">
+                <!-- Chat messages go here -->
+                <div class="chat-bubble bot-bubble">Hello! I'm your secure AI assistant. I can help you with sensitive data without exposing it. Try sending some PII!</div>
+            </div>
+            <div class="p-4 border-t bg-gray-50">
+                <form id="chat-form" class="flex gap-2">
+                    <input type="text" id="user-input" class="flex-1 p-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Type a message with PII (e.g., My PAN is ABCDE1234F)" required>
+                    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 transition">Send</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Right: Inspector -->
+        <div class="w-1/2 flex flex-col bg-white">
+            <div class="p-3 border-b bg-gradient-to-r from-blue-50 to-purple-50 font-semibold flex justify-between items-center">
+                <span>🔍 PII Detection Analysis</span>
+                <span id="bert-badge" class="text-xs bg-purple-100 text-purple-700 px-2 py-1 rounded hidden">BERT Active</span>
+            </div>
+            <div id="inspector-container" class="flex-1 p-4 overflow-y-auto">
+                <div class="text-center text-gray-400 mt-10 italic">Send a message to see the PII detection process...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:8000/api/v1';
+        const API_KEY = 'demo-key';
+        const SESSION_ID = 'session_' + Date.now();
+
+        const chatContainer = document.getElementById('chat-container');
+        const inspectorContainer = document.getElementById('inspector-container');
+        const chatForm = document.getElementById('chat-form');
+        const userInput = document.getElementById('user-input');
+        const bertBadge = document.getElementById('bert-badge');
+
+        function addMessage(text, isUser) {
+            const div = document.createElement('div');
+            div.className = `chat-bubble ${isUser ? 'user-bubble' : 'bot-bubble'}`;
+            div.textContent = text;
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function highlightPII(text, entities) {
+            if (!entities || entities.length === 0) return text;
+            
+            // Sort by start position descending to replace from end to start
+            const sorted = [...entities].sort((a, b) => b.start - a.start);
+            let result = text;
+            
+            for (const entity of sorted) {
+                const original = entity.text;
+                const piiClass = `pii-${entity.type}`;
+                const sourceClass = `source-${entity.source || 'default'}`;
+                const highlighted = `<span class="pii-highlight ${piiClass}">${original}<span class="source-badge ${sourceClass}">${entity.source || '?'}</span></span>`;
+                result = result.substring(0, entity.start) + highlighted + result.substring(entity.end);
+            }
+            
+            return result;
+        }
+
+        function createMappingVisual(entities) {
+            if (!entities || entities.length === 0) {
+                return '<div class="text-gray-400 text-sm italic">No PII detected</div>';
+            }
+            
+            let html = '<div class="space-y-2">';
+            entities.forEach(entity => {
+                const piiClass = `pii-${entity.type}`;
+                html += `
+                    <div class="mapping-item">
+                        <span class="pii-highlight ${piiClass} flex-shrink-0">${entity.text}</span>
+                        <span class="mapping-arrow">→</span>
+                        <code class="text-xs bg-gray-100 px-2 py-1 rounded flex-1">${entity.token}</code>
+                        <span class="text-xs text-gray-500 ml-2">${(entity.score * 100).toFixed(0)}%</span>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            return html;
+        }
+
+        function showDetectionResults(originalText, maskData) {
+            // Clear inspector
+            inspectorContainer.innerHTML = '';
+            
+            // Show BERT status
+            if (maskData.metadata && maskData.metadata.bert_enabled) {
+                bertBadge.classList.remove('hidden');
+            }
+            
+            // 1. Original Text with Highlights
+            const highlightSection = document.createElement('div');
+            highlightSection.className = 'mb-6';
+            highlightSection.innerHTML = `
+                <h3 class="font-bold text-gray-700 mb-2 flex items-center">
+                    <span class="text-lg mr-2">📝</span>
+                    Original Text (Highlighted)
+                </h3>
+                <div class="bg-white border border-gray-200 rounded-lg p-4 leading-relaxed">
+                    ${highlightPII(originalText, maskData.entities)}
+                </div>
+            `;
+            inspectorContainer.appendChild(highlightSection);
+            
+            // 2. Detection Metadata
+            if (maskData.metadata) {
+                const metaSection = document.createElement('div');
+                metaSection.className = 'mb-6';
+                metaSection.innerHTML = `
+                    <h3 class="font-bold text-gray-700 mb-2 flex items-center">
+                        <span class="text-lg mr-2">🔬</span>
+                        Detection Pipeline Stats
+                    </h3>
+                    <div class="bg-gradient-to-r from-blue-50 to-purple-50 border border-blue-200 rounded-lg p-4 grid grid-cols-2 gap-3 text-sm">
+                        <div><span class="font-semibold">BERT Enabled:</span> ${maskData.metadata.bert_enabled ? '✅ Yes' : '❌ No'}</div>
+                        <div><span class="font-semibold">BERT Entities:</span> ${maskData.metadata.bert_entities_found || 0}</div>
+                        <div><span class="font-semibold">Presidio Entities:</span> ${maskData.metadata.presidio_entities_found || 0}</div>
+                        <div><span class="font-semibold">Final Count:</span> ${maskData.metadata.final_entity_count || 0}</div>
+                    </div>
+                `;
+                inspectorContainer.appendChild(metaSection);
+            }
+            
+            // 3. PII Mapping
+            const mappingSection = document.createElement('div');
+            mappingSection.className = 'mb-6';
+            mappingSection.innerHTML = `
+                <h3 class="font-bold text-gray-700 mb-2 flex items-center">
+                    <span class="text-lg mr-2">🗺️</span>
+                    PII → Token Mapping
+                </h3>
+                <div class="bg-gray-50 border border-gray-200 rounded-lg p-4">
+                    ${createMappingVisual(maskData.entities)}
+                </div>
+            `;
+            inspectorContainer.appendChild(mappingSection);
+            
+            // 4. Masked Output
+            const maskedSection = document.createElement('div');
+            maskedSection.className = 'mb-6';
+            maskedSection.innerHTML = `
+                <h3 class="font-bold text-gray-700 mb-2 flex items-center">
+                    <span class="text-lg mr-2">🔒</span>
+                    Masked Output (Safe for LLM)
+                </h3>
+                <div class="bg-green-50 border border-green-200 rounded-lg p-4 font-mono text-sm">
+                    ${maskData.masked_text}
+                </div>
+            `;
+            inspectorContainer.appendChild(maskedSection);
+        }
+
+        async function processMessage(text) {
+            try {
+                const maskResp = await fetch(`${API_URL}/mask`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+                    body: JSON.stringify({
+                        text: text,
+                        session_id: SESSION_ID,
+                        context: { user_id: 'web_user', purpose: 'chat_demo' }
+                    })
+                });
+                const maskData = await maskResp.json();
+                
+                // Show detection results
+                showDetectionResults(text, maskData);
+
+                // Mock LLM Response
+                const mockLLMResponse = `I processed your request securely. I see you mentioned: ${maskData.masked_text}. How can I help further?`;
+                
+                // Unmask for display
+                const unmaskResp = await fetch(`${API_URL}/unmask`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+                    body: JSON.stringify({
+                        text: mockLLMResponse,
+                        session_id: SESSION_ID,
+                        context: { user_id: 'web_user', user_role: 'admin' }
+                    })
+                });
+                const unmaskData = await unmaskResp.json();
+                
+                // Show final response in chat
+                addMessage(unmaskData.unmasked_text, false);
+
+            } catch (error) {
+                console.error(error);
+                addMessage("Sorry, something went wrong with the secure gateway.", false);
+            }
+        }
+
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const text = userInput.value.trim();
+            if (!text) return;
+
+            addMessage(text, true);
+            userInput.value = '';
+            
+            await processMessage(text);
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,264 @@
+import spacy
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer, RecognizerResult
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+from typing import List, Dict, Any, Optional
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class PIIDetector:
+    """
+    Wrapper around Presidio Analyzer and spaCy for PII detection.
+    """
+    
+    def __init__(self):
+        # Initialize Presidio Analyzer with explicit NLP engine configuration
+        # Force Presidio to use en_core_web_sm instead of the default en_core_web_lg
+        from presidio_analyzer.nlp_engine import NlpEngineProvider
+        
+        nlp_configuration = {
+            "nlp_engine_name": "spacy",
+            "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
+        }
+        
+        nlp_engine = NlpEngineProvider(nlp_configuration=nlp_configuration).create_engine()
+        self.analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
+        self.anonymizer = AnonymizerEngine()
+        
+        # Load spaCy model for additional context if needed (Presidio uses it internally too)
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            logger.warning("en_core_web_sm not found, downloading...")
+            from spacy.cli import download
+            download("en_core_web_sm")
+            self.nlp = spacy.load("en_core_web_sm")
+        
+        # Add custom recognizers for better accuracy
+        self._add_custom_recognizers()
+        
+        # HuggingFace BERT API (optional fallback)
+        from api.config import settings
+        self.hf_api_key = settings.HUGGINGFACE_API_KEY
+        self.hf_api_url = settings.HUGGINGFACE_API_URL
+        self.use_bert_fallback = bool(self.hf_api_key)
+        
+        Args:
+            text: Input text to analyze
+            language: Language code (default: 'en')
+            confidence_threshold: Minimum confidence score to include entity (default: 0.6)
+        """
+        # 1. Run Presidio detection
+        # We pass entities=None to allow ALL loaded recognizers to run
+        results = self.analyzer.analyze(
+            text=text,
+            language=language,
+            entities=None,  # Detect ALL supported entities
+            score_threshold=0.4
+        )
+        
+        # 2. Add spaCy NER fallback for addresses and names
+        ner_entities = self._spacy_ner_fallback(text)
+        results.extend(ner_entities)
+        
+        # 3. Add BERT API fallback (if enabled)
+        bert_entities = self._bert_api_fallback(text)
+        results.extend(bert_entities)
+        
+        # 4. Filter by confidence threshold
+        filtered_results = [r for r in results if r.score >= confidence_threshold]
+        
+        # 5. Remove overlapping/duplicate entities
+        deduplicated_results = self._remove_overlapping_entities(filtered_results)
+        
+        # 6. Convert to dictionary format
+        detected_entities = []
+        for result in deduplicated_results:
+            entity = {
+                "type": result.entity_type,
+                "start": result.start,
+                "end": result.end,
+                "score": result.score,
+                "text": text[result.start:result.end]
+            }
+            detected_entities.append(entity)
+            
+        return detected_entities
+    
+    def _spacy_ner_fallback(self, text: str) -> List[RecognizerResult]:
+        """
+        Use spaCy NER as fallback for entities Presidio might miss.
+        Focuses on: Addresses (GPE, LOC, FAC), Organizations, and additional Person names.
+        """
+        fallback_entities = []
+        
+        try:
+            doc = self.nlp(text)
+            
+            for ent in doc.ents:
+                # Skip if entity text is a stopword
+                if ent.text.lower() in self.pii_stopwords:
+                    continue
+                
+                # Map spaCy labels to PII types
+                if ent.label_ in ["GPE", "LOC", "FAC"]:  # Geo-political, Location, Facility
+                    # These are likely addresses or locations
+                    fallback_entities.append(
+                        RecognizerResult(
+                            entity_type="ADDRESS_NER",
+                            start=ent.start_char,
+                            end=ent.end_char,
+                            score=0.65  # Medium confidence for NER
+                        )
+                    )
+                elif ent.label_ == "PERSON":
+                    # Additional person names that Presidio might have missed
+                    fallback_entities.append(
+                        RecognizerResult(
+                            entity_type="PERSON",
+                            start=ent.start_char,
+                            end=ent.end_char,
+                            score=0.7
+                        )
+                    )
+                elif ent.label_ == "ORG":
+                    # Skip common PII keywords that spaCy incorrectly tags as ORG
+                    if ent.text.lower() not in self.pii_stopwords:
+                        fallback_entities.append(
+                            RecognizerResult(
+                                entity_type="ORGANIZATION",
+                                start=ent.start_char,
+                                end=ent.end_char,
+                                score=0.6
+                            )
+                        )
+        except Exception as e:
+            logger.warning(f"spaCy NER fallback failed: {e}")
+        
+        return fallback_entities
+    
+    def _bert_api_fallback(self, text: str) -> List[RecognizerResult]:
+        """
+        Use HuggingFace BERT API as fallback for complex PII detection.
+        Only runs if API key is configured.
+        """
+        if not self.use_bert_fallback:
+            return []
+        
+        fallback_entities = []
+        
+        try:
+            import requests
+            
+            headers = {"Authorization": f"Bearer {self.hf_api_key}"}
+            payload = {"inputs": text}
+            
+            response = requests.post(
+                self.hf_api_url,
+                headers=headers,
+                json=payload,
+                timeout=5  # 5 second timeout
+            )
+            
+            if response.status_code == 200:
+                bert_results = response.json()
+                
+                # Convert HuggingFace NER format to RecognizerResult
+                for entity in bert_results:
+                    # HuggingFace returns: {'entity_group': 'PER', 'score': 0.95, 'word': 'John', 'start': 0, 'end': 4}
+                    entity_type = self._map_bert_entity_type(entity.get('entity_group', 'UNKNOWN'))
+                    
+                    fallback_entities.append(
+                        RecognizerResult(
+                            entity_type=entity_type,
+                            start=entity['start'],
+                            end=entity['end'],
+                            score=entity['score']
+                        )
+                    )
+                
+                logger.info(f"BERT API detected {len(fallback_entities)} additional entities")
+            else:
+                logger.warning(f"BERT API returned status {response.status_code}")
+                
+        except requests.exceptions.Timeout:
+            logger.warning("BERT API timeout - skipping fallback")
+        except Exception as e:
+            logger.warning(f"BERT API fallback failed: {e}")
+        
+        return fallback_entities
+    
+    def _map_bert_entity_type(self, bert_type: str) -> str:
+        """Map BERT entity types to our PII types."""
+        mapping = {
+            'PER': 'PERSON',
+            'PERSON': 'PERSON',
+            'LOC': 'LOCATION',
+            'LOCATION': 'LOCATION',
+            'ORG': 'ORGANIZATION',
+            'ORGANIZATION': 'ORGANIZATION',
+            'EMAIL': 'EMAIL_ADDRESS',
+            'PHONE': 'PHONE_NUMBER',
+            'SSN': 'SSN_RELAXED',
+            'CREDIT_CARD': 'CREDIT_CARD',
+            'DATE': 'DATE_TIME',
+            'ADDRESS': 'ADDRESS_NER'
+        }
+        return mapping.get(bert_type.upper(), bert_type)
+    
+    def _remove_overlapping_entities(self, entities: List[RecognizerResult]) -> List[RecognizerResult]:
+        """
+        Remove overlapping entities, keeping the one with highest confidence.
+        If confidence is equal, keep the longer entity.
+        """
+        if not entities:
+            return []
+        
+        # Sort by start position, then by score (descending)
+        sorted_entities = sorted(entities, key=lambda x: (x.start, -x.score))
+        
+        deduplicated = []
+        
+        for entity in sorted_entities:
+            # Check if this entity overlaps with any already accepted entity
+            overlaps = False
+            for accepted in deduplicated:
+                # Check for overlap
+                if not (entity.end <= accepted.start or entity.start >= accepted.end):
+                    # There's an overlap
+                    overlaps = True
+                    
+                    # If current entity has higher score, replace the accepted one
+                    if entity.score > accepted.score:
+                        deduplicated.remove(accepted)
+                        deduplicated.append(entity)
+                    elif entity.score == accepted.score:
+                        # If scores are equal, keep the longer entity
+                        if (entity.end - entity.start) > (accepted.end - accepted.start):
+                            deduplicated.remove(accepted)
+                            deduplicated.append(entity)
+                    break
+            
+            if not overlaps:
+                deduplicated.append(entity)
+        
+        # Sort by start position for final output
+        return sorted(deduplicated, key=lambda x: x.start)
+
+    def anonymize(self, text: str, operators: Optional[Dict[str, OperatorConfig]] = None) -> str:
+        """
+        Basic anonymization using Presidio (mostly for fallback/simple cases).
+        For the full PII Shield, we use our own masking service with vault.
+        """
+        results = self.analyzer.analyze(text=text, language='en')
+        anonymized_result = self.anonymizer.anonymize(
+            text=text,
+            analyzer_results=results,
+            operators=operators
+        )
+        return anonymized_result.text
+
+pii_detector = PIIDetector()
