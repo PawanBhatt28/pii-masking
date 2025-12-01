@@ -142,7 +142,7 @@ class AuditService:
             if conn:
                 conn.close()
 
-    def get_events(self, session_id: str = None, limit: int = 50) -> List[Dict]:
+    def get_events(self, limit: int = 50) -> List[Dict]:
         """
         Retrieve audit events.
         """
@@ -152,10 +152,7 @@ class AuditService:
         query = "SELECT * FROM audit_events"
         params = []
         
-        if session_id:
-            query += " WHERE session_id = %s"
-            params.append(session_id)
-            
+
         query += " ORDER BY timestamp DESC LIMIT %s"
         params.append(limit)
         
